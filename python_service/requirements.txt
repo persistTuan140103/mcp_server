@@ -1,0 +1,7 @@
+fastapi[standard]
+langchain-community==0.3.24
+unstructured-client==0.36.0
+langchain-unstructured==0.1.6
+python-multipart==0.0.20
+torch==2.7.1
+FlagEmbedding==
