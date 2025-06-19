@@ -8,11 +8,11 @@ from dotenv import load_dotenv
 load_dotenv()
 
 # Initialize FastMCP server
-mcp = FastMCP("document_school")
+mcp = FastMCP("document_school", stateless_http = True)
 
 # Constants
-URL_RAG_API = os.getenv("URL_RAG_API")
-COLLECTION_NAME = os.getenv("COLLECTION_NAME")
+URL_RAG_API = os.getenv("URL_RAG_API") or "http://localhost:8000"
+COLLECTION_NAME = os.getenv("COLLECTION_NAME") or "my_collection"
 # USER_AGENT = "weather-app/1.0"
 
 print("URL_RAG_API: ", URL_RAG_API)
@@ -31,19 +31,30 @@ async def document_school(query: str) -> str:
     """
     
     try:
-        result_seatch = await client.post("/search-text", json={"text": query, 'collection_name': COLLECTION_NAME})
+        # /search-text is the endpoint of the rag. It return the list[Document]
+        result_search = await client.post("/search-text", 
+                                        json={"text_query": query, 
+                                              'collection_name': COLLECTION_NAME,
+                                              "limit": 10})
+        print("result_search: ", result_search)
         
-        if(result_seatch.status_code == 200):
-            res = result_seatch.json()
-            page_content = res['page_content']
-            if(len(page_content) > 0):
-                return page_content
+        if result_search.status_code == 200:
+            documents = result_search.json()
+            if len(documents) > 0:
+                # Format each document's content with its metadata
+                formatted_results = []
+                for doc in documents:
+                    content = f"Content: {doc['page_content']}\nScore: {doc['metadata']['score']}"
+                    formatted_results.append(content)
+                
+                return "Context from RAG:\n" + "\n---\n".join(formatted_results)
             else:
-                return "Error: No content from search"
+                return "No relevant documents found"
         else:
-            return "Error: " + result_seatch.text
+            return f"Error: API returned status code {result_search.status_code}"
+            
     except Exception as e:
-        return f"Error: from rag api {e}"
+        return f"Error: from rag api {str(e)}"
     
 if __name__ == "__main__":
     mcp.run(transport="stdio")
