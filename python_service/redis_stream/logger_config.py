@@ -39,4 +39,4 @@ def setup_logging():
     return logger
 
 # Gọi hàm setup_logging khi module này được import
-# logger = setup_logging() # Uncomment dòng này nếu bạn muốn sử dụng logger đã cấu hình trực tiếp từ đây
+logger = setup_logging() # Uncomment dòng này nếu bạn muốn sử dụng logger đã cấu hình trực tiếp từ đây

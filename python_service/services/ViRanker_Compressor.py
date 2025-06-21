@@ -1,6 +1,6 @@
 from typing import Sequence, List
 from fsspec import Callback
-from pydantic import BaseModel
+from pydantic import BaseModel, Field, ConfigDict
 from langchain.retrievers.document_compressors.base import (
     BaseDocumentCompressor,
 )
@@ -13,7 +13,13 @@ class ViRankerCompressor(BaseDocumentCompressor):
     It is a subclass of BaseDocumentCompressor.
     get top_k documents from the documents list.
     """
+    reRanker: FlagReranker = Field(default=None)
+    top_k: int = Field(default=3)
+    
+    model_config = ConfigDict(arbitrary_types_allowed=True)
+
     def __init__(self, model_name: str = "namdp-ptit/ViRanker", top_k: int = 3):
+        super().__init__()
         self.reRanker = FlagReranker(model_name, use_fp16=True)
         self.top_k = top_k
         
@@ -28,7 +34,7 @@ class ViRankerCompressor(BaseDocumentCompressor):
         
         scores = self.reRanker.compute_score(sentence_pairs=pairs, normalize=True)
 
-        doc_scores = List(zip(documents, scores))
+        doc_scores = list(zip(documents, scores))
         
         doc_scores.sort(key=lambda x: x[1], reverse=True)
         

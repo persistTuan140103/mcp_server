@@ -9,3 +9,6 @@ unstructured==0.17.2
 python-multipart==0.0.20
 torch==2.7.1
 FlagEmbedding==1.3.5 
+# markdownify==1.1.0
+# pyhtml2md==1.7.0
+html2text==2025.4.15

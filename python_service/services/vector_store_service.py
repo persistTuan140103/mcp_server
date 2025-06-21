@@ -13,7 +13,7 @@ from qdrant_client import AsyncQdrantClient, models, QdrantClient
 from models.QdrantModel import QdrantStatus, QdrantCollection
 import logging
 from unstructured.cleaners.core import clean
-from services import ViRankerCompressor
+from services.ViRanker_Compressor import ViRankerCompressor
 
 logger = logging.getLogger(__name__)
 
@@ -61,21 +61,7 @@ class VectorStoreService:
                                 embedding=self.embedding
                             )
         
-        self.viRankerCompressor = ViRankerCompressor()
         
-        self.compressor = CrossEncoderReranker(
-            model=HuggingFaceCrossEncoder(
-                model_name=settings.HUGGINGFACE_MODEL_RERANK,
-                model_kwargs={"device": "cuda" if torch.cuda.is_available() else "cpu"}
-            ),
-            top_n=3
-        )
-        self.retriever = ContextualCompressionRetriever(
-            base_compressor=self.viRankerCompressor,
-            base_retriever=self.vector_store.as_retriever(
-                search_kwargs={"k": 20, "score_threshold": 0.7}
-            )
-        )
         self.async_client :AsyncQdrantClient= None
         
     async def get_async_client(self):
@@ -225,9 +211,26 @@ class VectorStoreService:
             )
 
     async def search(self, collection_name: str,
-                     text_query: str, limit :int = 20
+                     text_query: str, limit :int = 20,
+                     score_threshold: float = 0.7,
+                     filters: list[str] = None
                      ) -> list[Document]:
-        
+        """_summary_
+
+        Args:
+            collection_name (str): _description_
+            text_query (str): _description_
+            limit (int, optional): _description_. Defaults to 20.
+            score_threshold (float, optional): _description_. Defaults to 0.7.
+            filters (list[str], optional): filters is list key in metadata is indexed. Defaults to None.
+
+        Raises:
+            Exception: _description_
+            Exception: _description_
+
+        Returns:
+            list[Document]: _description_
+        """
         text_query = clean(
             text_query,
             extra_whitespace=True,
@@ -236,6 +239,15 @@ class VectorStoreService:
             trailing_punctuation=True,
             lowercase=True
         )   
+        filter_must: list[models.FieldCondition]= []
+        if(filters is not None and score_threshold == -1):
+            for filter in filters:
+                filter_must.append(
+                    models.FieldCondition(
+                        key=filter,
+                        match=models.MatchText(text=text_query)
+                    )
+                )
         
         exists = await self.check_collection_exists(collection_name)
         if not exists:
@@ -245,7 +257,11 @@ class VectorStoreService:
         try:
             res = await self.vector_store.asimilarity_search_with_relevance_scores(
                 query=text_query,
-                k=limit
+                k=limit,
+                score_threshold= None if score_threshold == -1 else score_threshold,
+                filter=models.Filter(
+                    must=filter_must
+                )
             )
             documents :list[Document] = []
 
@@ -274,7 +290,10 @@ class VectorStoreService:
         except Exception as e:
             raise Exception(e)
     
-    async def compress_documents(self, query: str) -> list[Document]:
+    async def compress_documents(self, query: str,
+                                 limit_trieved: int = 20,
+                                 limit_compressed: int = 3,
+                                 score_threshold: float = 0.7) -> list[Document]:
         """
         Compress documents using the retriever
 
@@ -290,7 +309,52 @@ class VectorStoreService:
             list[Document]: _description_
         """
         try:
+            self.viRankerCompressor = ViRankerCompressor(top_k=limit_compressed)
+        
+            self.compressor = CrossEncoderReranker(
+                model=HuggingFaceCrossEncoder(
+                    model_name=settings.HUGGINGFACE_MODEL_RERANK,
+                    model_kwargs={"device": "cuda" if torch.cuda.is_available() else "cpu"}
+                ),
+                top_n=3
+            )
+            self.retriever = ContextualCompressionRetriever(
+                base_compressor=self.viRankerCompressor,
+                base_retriever=self.vector_store.as_retriever(
+                    search_kwargs={"k": limit_trieved, "score_threshold": score_threshold}
+                )
+            )
             res = await self.retriever.ainvoke(query)
+            return res
+        except Exception as e:
+            raise Exception(e)
+        
+
+    async def search_full_text(self, query: str, limit: int = 3) -> list[Document]:
+        query_clean = clean(
+            query,
+            extra_whitespace=True,
+            dashes=True,
+            bullets=True,
+            trailing_punctuation=True,
+            lowercase=True
+        )   
+        filter = models.FieldCondition(
+            key="title_of_chunk",
+            match=models.MatchText(text=query)
+        )
+        
+        try:
+            res = await self.vector_store.asimilarity_search(
+                query=query_clean,
+                k=limit,
+                filter=models.Filter(
+                    must=[
+                        filter
+                    ]
+                )
+            )
+            
             return res
         except Exception as e:
             raise Exception(e)

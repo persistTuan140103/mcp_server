@@ -18,11 +18,13 @@ services:
     container_name: consumer
     depends_on:
       - redis
+    volumes:
+      - .env:/app/.env
     environment:
       - REDIS_HOST=redis
       - REDIS_PORT=6379
       - REDIS_DB=0
-      - EXTERNAL_API_URL=${EXTERNAL_API_URL}
+      # - EXTERNAL_API_URL=${EXTERNAL_API_URL}
       - GROUP_NAME=${GROUP_NAME}
       - STREAM_NAME=${STREAM_NAME}
       - RETRY_STREAM_NAME=${RETRY_STREAM_NAME}

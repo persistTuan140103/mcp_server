@@ -13,7 +13,10 @@ from typing import Any, List
 import logging
 from services import RedisService, VectorStoreService
 import json
+from redis_stream import setup_logging
 
+
+setup_logging()
 logger = logging.getLogger(__name__)
 
 def deprecated(func):
@@ -42,9 +45,9 @@ async def init_services():
 
 
 # Khởi tạo services
-document_processor = None
-vector_store_service = None
-redis_service = None
+document_processor: DocumentProcessor= None
+vector_store_service: VectorStoreService = None
+redis_service: RedisService = None
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -52,8 +55,14 @@ async def lifespan(app: FastAPI):
     document_processor, vector_store_service, redis_service = await init_services()
     yield
     
-app = FastAPI(lifespan=lifespan)
+app = FastAPI(
+    lifespan=lifespan,
+    # openapi_url="/openapi.json",
+    )
 
+@app.get("/health")
+async def health_check():
+    return {"status": "ok"}
 
 @app.post("/process-file-docx", response_model=List[Document])
 async def process_file_docx(
@@ -84,21 +93,18 @@ async def process_file_docx(
         try:
             # documents = await document_processor.process_docx_document(docx_model)
             lengthDocuments = 0
-            tmp_documents = []
+            tmp_documents: List[Document] = []
             async for doc in document_processor.process_docx_document(docx_model):
-                metadata = {
-                    "emphasized_text_contents": doc.metadata["emphasized_text_contents"] if "emphasized_text_contents" in doc.metadata else "",
-                    "filename": doc.metadata["filename"],
-                    "content_title_of_chunk": doc.metadata["content_title_of_chunk"],
-                }
                 if(lengthDocuments < get_max_documents or get_max_documents == -1):
-                    tmp_documents.append({
-                        "page_content": doc.page_content,
-                        "metadata": metadata
-                    })
+                    # print("Document: ", doc)
+                    doc.metadata.pop("orig_elements_decoded") # orig support for test
+                    tmp_documents.append(doc)
+                else:
+                    return tmp_documents
                 lengthDocuments += 1
             return tmp_documents
         except Exception as e:
+            logger.error(f"Processing Docx: {e}")
             raise HTTPException(
                 status_code=400, 
                 detail=f"Error processing DOCX file: {str(e)}"
@@ -133,16 +139,14 @@ async def process_file_pdf(
         )
         lengthDocuments = 0
         async for doc in document_processor.process_pdf_document(pdf_model):
-            metadata = {
-                    "emphasized_text_contents": doc.metadata["emphasized_text_contents"] if "emphasized_text_contents" in doc.metadata else "",
-                    "filename": doc.metadata["filename"],
-                    # "content_title_of_chunk": doc.metadata["content_title_of_chunk"],
-                }
             if(lengthDocuments < get_max_documents or get_max_documents == -1):
+                doc.metadata.pop("orig_elements_decoded") # orig support for testing
                 documents.append({
                     "page_content": doc.page_content,
-                    "metadata": metadata
+                    "metadata": doc.metadata
                 })
+            else:
+                break
             lengthDocuments += 1
         return documents
     else:
@@ -174,14 +178,10 @@ async def process_file_pdf_redis(
         try:
             
             async for doc in document_processor.process_pdf_document(pdf_model):
-                metadata = {
-                    "emphasized_text_contents": doc.metadata["emphasized_text_contents"] if "emphasized_text_contents" in doc.metadata else "",
-                    "filename": doc.metadata["filename"],
-                    "content_title_of_chunk": doc.metadata["content_title_of_chunk"] if "content_title_of_chunk" in doc.metadata else "",
-                }
+                doc.metadata.pop("orig_elements_decoded")
                 message = {
                     "page_content": doc.page_content,
-                    "metadata": json.dumps(metadata, ensure_ascii=False)
+                    "metadata": json.dumps(doc.metadata, ensure_ascii=False)
                 }
                 await redis_service.add_to_stream(
                     message=message,
@@ -207,7 +207,7 @@ async def process_file_docx_redis(
     get_max_documents: int = Form(20)
 ) -> List[Document]:
     documents = []
-    lengthDocuments = 0
+    index = 0
     supported_types = [
         "application/vnd.openxmlformats-officedocument.wordprocessingml.document",  # .docx
         "application/msword"  # .doc
@@ -225,30 +225,31 @@ async def process_file_docx_redis(
         )
         try:
             async for doc in document_processor.process_docx_document(docx_model):
-                metadata = {
-                    "emphasized_text_contents": doc.metadata["emphasized_text_contents"] if "emphasized_text_contents" in doc.metadata else "",
-                    "filename": doc.metadata["filename"],
-                    "content_title_of_chunk": doc.metadata["content_title_of_chunk"] if "content_title_of_chunk" in doc.metadata else "",
-                }
+                print(f"Nhận chunk index: {index}")
+                doc.metadata.pop("orig_elements_decoded")
                 message = {
                     "page_content": doc.page_content,
-                    "metadata": json.dumps(metadata, ensure_ascii=False)
+                    "metadata": json.dumps(doc.metadata, ensure_ascii=False)
                 }   
                 # print(message)
-                await redis_service.add_to_stream(
+                res = await redis_service.add_to_stream(
                     message=message,
                     stream_name=redis_service.STREAM_NAME
                 )
-                if(lengthDocuments < get_max_documents):
+                if(res is None):
+                    logger.error(f"Error adding message to {redis_service.STREAM_NAME}")
+                if(index < get_max_documents or get_max_documents == -1):
                     documents.append(doc)
-                lengthDocuments += 1
+                index += 1
         except Exception as e:
             logger.error(f"Error processing DOCX file: {e}")
             raise HTTPException(status_code=500, detail=f"Error processing DOCX file: {e}")
-        logger.info(f"send {lengthDocuments} documents to redis")
+        logger.info(f"send {index} documents to redis")
         return documents
     else:
         raise HTTPException(status_code=400, detail="Unsupported file type. Please upload a DOC or DOCX file.")
+
+
 @app.post("/embedd-text")
 async def embedd_text(
     text: str = Body(...),
@@ -304,10 +305,15 @@ async def create_collection(
 async def search(
     collection_name: str = Body(...),
     text_query: str = Body(...),
-    limit: int = Body(20)
+    limit: int = Body(20),
+    score_threshold: float = Body(-1),
+    filters: list[str] = Body(["title_of_chunk"])
 ) -> list[Document]:
     try:
-        res = await vector_store_service.search(collection_name, text_query)
+        res = await vector_store_service.search(
+            collection_name, text_query, 
+            limit=limit, score_threshold=score_threshold if score_threshold != -1 else None,
+            filters=filters)
         if(len(res) > 0):
             return res
         else:
@@ -318,21 +324,37 @@ async def search(
 
 @app.post("/search-rag")
 async def search_rag(
-    text_query: str = Body(...)
+    text_query: str = Body(...),
+    limit: int = Body(20),
+    limit_compressed: int = Body(3),
+    score_threshold: float = Body(0.7)
 ) -> list[Document]:
     try:
-        res = await vector_store_service.compress_documents(text_query)
+        res = await vector_store_service.compress_documents(
+            text_query, limit_trieved=limit, 
+            limit_compressed=limit_compressed, score_threshold=score_threshold)
         return res
     except Exception as e:
         logger.error(f"Error searching RAG: {e}")
         raise HTTPException(status_code=500, detail=f"Error searching RAG: {e}")
 
+@app.post("/create-index")
+async def create_index(
+    collection_name: str = Body(...),
+    field_names: list[str] = Body(...)
+) -> Any:
+    try:
+        return await vector_store_service.create_index_full_text(collection_name, field_names)
+    except Exception as e:
+        logger.error(f"Error creating index: {e}")
     
+    
+
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(
         app,
         host="0.0.0.0",
-        port=8000,
+        port=8001,
         reload=True,  # Enable auto-reload
     )
