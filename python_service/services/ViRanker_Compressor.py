@@ -1,45 +1,81 @@
-from typing import Sequence, List
+from typing import Any, Dict, Sequence, List, Tuple
 from fsspec import Callback
 from pydantic import BaseModel, Field, ConfigDict
 from langchain.retrievers.document_compressors.base import (
     BaseDocumentCompressor,
 )
+from langchain_community.cross_encoders.base import BaseCrossEncoder
+
 from langchain.schema import Document
 from FlagEmbedding import FlagReranker
 
-class ViRankerCompressor(BaseDocumentCompressor):
-    """
-    ViRankerCompressor is a document compressor that uses ViRanker to compress documents.
-    It is a subclass of BaseDocumentCompressor.
-    get top_k documents from the documents list.
-    """
-    reRanker: FlagReranker = Field(default=None)
-    top_k: int = Field(default=3)
+class ViRankerCrossEncoder(BaseModel, BaseCrossEncoder):
+    class Config:
+        arbitrary_types_allowed = True
+
+    """Vietnamese Ranker cross encoder using FlagEmbedding library.
     
-    model_config = ConfigDict(arbitrary_types_allowed=True)
+    This model is based on BAAI/bge-m3 and fine-tuned for Vietnamese text ranking.
+    It's recommended to use FlagEmbedding library as suggested by the model authors.
+    
+    Example:
+        .. code-block:: python
 
-    def __init__(self, model_name: str = "namdp-ptit/ViRanker", top_k: int = 3):
-        super().__init__()
-        self.reRanker = FlagReranker(model_name, use_fp16=True)
-        self.top_k = top_k
-        
-    def compress_documents(
-        self,
-        documents: Sequence[Document],
-        query: str,
-        callbacks: Callback | None = None,
-    ) -> Sequence[Document]: 
-        
-        pairs = [[query, doc.page_content] for doc in documents]
-        
-        scores = self.reRanker.compute_score(sentence_pairs=pairs, normalize=True)
+            from your_module import ViRankerCrossEncoder
 
-        doc_scores = list(zip(documents, scores))
+            model_name = "namdp-ptit/ViRanker"
+            model_kwargs = {'use_fp16': True}
+            reranker = ViRankerCrossEncoder(
+                model_name=model_name,
+                model_kwargs=model_kwargs
+            )
+    """
+
+    model_name: str = "namdp-ptit/ViRanker"
+    model_kwargs: Dict[str, Any] = Field(default_factory=dict)
+    normalize: bool = True
+    client: FlagReranker = None  #: :meta private:
+
+    def __init__(self, **kwargs: Any):
+        """Initialize the ViRanker cross encoder using FlagEmbedding."""
+        super().__init__(**kwargs)
         
-        doc_scores.sort(key=lambda x: x[1], reverse=True)
+        # try:
+        #     from FlagEmbedding import FlagReranker
+        # except ImportError as exc:
+        #     raise ImportError(
+        #         "Could not import FlagEmbedding python package. "
+        #         "Please install it with `pip install FlagEmbedding`."
+        #     ) from exc
+
+        # Initialize FlagReranker with model kwargs
+        self.client = FlagReranker(
+            self.model_name, 
+            use_fp16=True,
+            **self.model_kwargs
+        )
+
+    def score(self, text_pairs: List[Tuple[str, str]]) -> List[float]:
+        """Compute similarity scores using ViRanker model via FlagEmbedding.
+
+        Args:
+            text_pairs: The list of text pairs to score the similarity.
+
+        Returns:
+            List of scores, one for each pair.
+        """
+        if not text_pairs:
+            return []
         
-        compressor_documents = [doc for (doc, score) in doc_scores[:self.top_k]]
-        for (doc, score) in doc_scores[:self.top_k]:
-            doc.metadata["score"] = score
-            
-        return compressor_documents
+        # Convert tuples to lists as expected by FlagReranker
+        pairs_list = [[pair[0], pair[1]] for pair in text_pairs]
+        
+        # Get scores using FlagReranker
+        if len(pairs_list) == 1:
+            # Single pair
+            score = self.client.compute_score(pairs_list[0], normalize=self.normalize)
+            return [float(score[0])]
+        else:
+            # Multiple pairs
+            scores = self.client.compute_score(pairs_list, normalize=self.normalize)
+            return [float(score) for score in scores]

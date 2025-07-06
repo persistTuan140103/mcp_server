@@ -12,3 +12,4 @@ FlagEmbedding==1.3.5
 # markdownify==1.1.0
 # pyhtml2md==1.7.0
 html2text==2025.4.15
+pypdf2==3.0.1

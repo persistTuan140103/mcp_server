@@ -1,9 +1,35 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+
 [project]
-name = "mcp-server"
+name = "tlu_mcp-server"
 version = "0.1.0"
-description = "Add your description here"
+description = "this is a mcp agent for document 'Kinh tế chính trị'"
+authors = [
+    {name = "Trần Quốc Tuấn", email = "khanghoa7896@gmail.com"}
+]
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
     "mcp[cli]>=1.9.3",
+]
+keywords = [
+    "mcp",
+    "agent",
+    "document",
+    "tlu rag"
+]
+
+[project.urls]
+repository = "https://github.com/persistTuan140103/mcp_server.git"
+
+[project.scripts]
+tlu_mcp_server = "tlu_mcp_server.server:main"
+[tool.hatch.version]
+path = "src/tlu_mcp_server/__init__.py"
+[tool.hatch.build.targets.wheel]
+packages = [
+    "src/tlu_mcp_server",
 ]

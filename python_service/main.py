@@ -2,7 +2,7 @@ import asyncio
 from contextlib import asynccontextmanager
 import io
 import warnings
-from fastapi import Body, FastAPI, Form, HTTPException, UploadFile, File
+from fastapi import Body, FastAPI, Form, HTTPException, UploadFile, File, Request
 from fastapi.responses import JSONResponse
 from models.DocxModel import DocxModel
 from models.PdfModel import PdfModel
@@ -14,6 +14,24 @@ import logging
 from services import RedisService, VectorStoreService
 import json
 from redis_stream import setup_logging
+from models.search_model import SearchRAGModel, SearchTextModel
+from fastapi.middleware.cors import CORSMiddleware
+
+
+from starlette.middleware.base import BaseHTTPMiddleware
+
+class TimeoutMiddleware(BaseHTTPMiddleware):
+    async def dispatch(self, request: Request, call_next):
+        try:
+            # Thiết lập timeout cho yêu cầu
+            response = await asyncio.wait_for(call_next(request), timeout=600)  # Timeout 300 giây
+            return response
+        except asyncio.TimeoutError:
+            return JSONResponse(
+                status_code=504,
+                content={"detail": "Request timed out"}
+            )
+
 
 
 setup_logging()
@@ -59,7 +77,14 @@ app = FastAPI(
     lifespan=lifespan,
     # openapi_url="/openapi.json",
     )
-
+app.add_middleware(TimeoutMiddleware)
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 @app.get("/health")
 async def health_check():
     return {"status": "ok"}
@@ -80,35 +105,38 @@ async def process_file_docx(
     
     if file.content_type in supported_types:
         file_content = await file.read()
-        file_name = file.filename
+        file_name = file.filename.split('.')[0]  # Extract the file name without extension
         file_obj = io.BytesIO(file_content)
-        file_io = io.BufferedReader(file_obj)
-        docx_model = DocxModel(
-            file=file_io,
-            file_name=file_name,
-            chunk_size=chunk_size,
-            chunk_overlap=chunk_overlap,
-            preserve_formatting=preserve_formatting
-        )
-        try:
-            # documents = await document_processor.process_docx_document(docx_model)
-            lengthDocuments = 0
-            tmp_documents: List[Document] = []
-            async for doc in document_processor.process_docx_document(docx_model):
-                if(lengthDocuments < get_max_documents or get_max_documents == -1):
-                    # print("Document: ", doc)
-                    doc.metadata.pop("orig_elements_decoded") # orig support for test
-                    tmp_documents.append(doc)
-                else:
-                    return tmp_documents
-                lengthDocuments += 1
-            return tmp_documents
-        except Exception as e:
-            logger.error(f"Processing Docx: {e}")
-            raise HTTPException(
-                status_code=400, 
-                detail=f"Error processing DOCX file: {str(e)}"
+        
+        index = 0
+        async for batch_page in document_processor.split_by_page_doc(file_obj):
+            docx_model = DocxModel(
+                file=batch_page,
+                file_name=file_name + f"_{index}.docx",
+                chunk_size=chunk_size,
+                chunk_overlap=chunk_overlap,
+                preserve_formatting=preserve_formatting
             )
+            index += 1
+            try:
+                # documents = await document_processor.process_docx_document(docx_model)
+                lengthDocuments = 0
+                tmp_documents: List[Document] = []
+                async for doc in document_processor.process_docx_document(docx_model):
+                    if(lengthDocuments < get_max_documents or get_max_documents == -1):
+                        # print("Document: ", doc)
+                        doc.metadata.pop("orig_elements_decoded") # orig support for test
+                        tmp_documents.append(doc)
+                    else:
+                        return tmp_documents
+                    lengthDocuments += 1
+                return tmp_documents
+            except Exception as e:
+                logger.error(f"Processing Docx: {e}")
+                raise HTTPException(
+                    status_code=400, 
+                    detail=f"Error processing DOCX file: {e}"
+                )
     else:
         raise HTTPException(
             status_code=400, 
@@ -122,32 +150,43 @@ async def process_file_pdf(
     chunk_overlap: int = Form(250),
     enable_ocr: bool = Form(True),
     extract_tables: bool = Form(True),
-    get_max_documents: int = Form(20)
+    get_max_documents: int = Form(20),
+    batch_page: int = Form(10)
 ) -> List[Document]:
     documents = []
     if(file.content_type == "application/pdf"):
         file_content = await file.read()
-        file_name = file.filename
+        file_name = file.filename.split('.')[0]  # Extract the file name without extension
         file_obj = io.BytesIO(file_content)
-        pdf_model = PdfModel(
-            file=file_obj,
-            file_name=file_name,
-            chunk_size=chunk_size,
-            chunk_overlap=chunk_overlap,
-            enable_ocr=enable_ocr,
-            extract_tables=extract_tables
-        )
-        lengthDocuments = 0
-        async for doc in document_processor.process_pdf_document(pdf_model):
-            if(lengthDocuments < get_max_documents or get_max_documents == -1):
-                doc.metadata.pop("orig_elements_decoded") # orig support for testing
-                documents.append({
-                    "page_content": doc.page_content,
-                    "metadata": doc.metadata
-                })
-            else:
-                break
-            lengthDocuments += 1
+        index = 0
+        async for batch_page in document_processor.split_by_page(file_obj, batch_page=batch_page):
+            pdf_model = PdfModel(
+                file=batch_page,
+                file_name=file_name + f"_{index}.pdf",
+                chunk_size=chunk_size,
+                chunk_overlap=chunk_overlap,
+                enable_ocr=enable_ocr,
+                extract_tables=extract_tables
+            )
+            index += 1
+            lengthDocuments = 0
+            try:
+                async for doc in document_processor.process_pdf_document(pdf_model):
+                    if(lengthDocuments < get_max_documents or get_max_documents == -1):
+                        # doc.metadata.pop("orig_elements_decoded") # orig support for testing
+                        documents.append({
+                            "page_content": doc.page_content,
+                            "metadata": doc.metadata
+                        })
+                    # else:
+                        # return documents
+                    lengthDocuments += 1
+            except Exception as e:
+                logger.error(f"Processing PDF: {e}")
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Error processing PDF file: {e}"
+                )
         return documents
     else:
         raise HTTPException(status_code=400, detail="Unsupported file type. Please upload a PDF file.")
@@ -159,42 +198,60 @@ async def process_file_pdf_redis(
     enable_ocr: bool = Form(True),
     extract_tables: bool = Form(True),
     file: UploadFile = File(...),
-    get_max_documents: int = Form(20)
+    get_max_documents: int = Form(20),
+    batch_page_size: int = Form(10)
 ) -> List[Document]:
     documents = []
     lengthDocuments = 0
     if(file.content_type == "application/pdf"):
         file_content = await file.read()
-        file_name = file.filename
+        file_name = file.filename.split('.')[0]  # Extract the file name without extension
         file_obj = io.BytesIO(file_content)
-        pdf_model = PdfModel(
-            file=file_obj,
-            file_name=file_name,
-            chunk_size=chunk_size,
-            chunk_overlap=chunk_overlap,
-            enable_ocr=enable_ocr,
-            extract_tables=extract_tables
-        )
-        try:
+        index = 0
+        async for batch_page in document_processor.split_by_page(file_obj, batch_page=batch_page_size):
+            pdf_model = PdfModel(
+                file=batch_page,
+                file_name=file_name + f"_{index}.pdf",
+                chunk_size=chunk_size,
+                chunk_overlap=chunk_overlap,
+                enable_ocr=enable_ocr,
+                extract_tables=extract_tables
+            )
+            index += 1
+        
+            try:
+                
+                async for doc in document_processor.process_pdf_document(pdf_model):
+                    doc.metadata.pop("orig_elements_decoded", None)
+                    message = {
+                        "page_content": doc.page_content,
+                        "metadata": json.dumps(doc.metadata, ensure_ascii=False)
+                    }
+                    await redis_service.add_to_stream(
+                        message=message,
+                        stream_name=redis_service.STREAM_NAME
+                    )
+                    if(lengthDocuments < get_max_documents or get_max_documents == -1):
+                        documents.append(doc)
+                    lengthDocuments += 1
+            except asyncio.CancelledError:
+                logger.info("Request cancelled by the client")
+                raise HTTPException(status_code=499, detail="Client closed request")
             
-            async for doc in document_processor.process_pdf_document(pdf_model):
-                doc.metadata.pop("orig_elements_decoded")
-                message = {
-                    "page_content": doc.page_content,
-                    "metadata": json.dumps(doc.metadata, ensure_ascii=False)
-                }
-                await redis_service.add_to_stream(
-                    message=message,
-                    stream_name=redis_service.STREAM_NAME
-                )
-                if(lengthDocuments < get_max_documents):
-                    documents.append(doc)
-                lengthDocuments += 1
-        except Exception as e:
-            logger.error(f"Error processing PDF file: {e}")
-            raise HTTPException(status_code=500, detail=f"Error processing PDF file: {e}")
-        logger.info(f"send {lengthDocuments} documents to redis")
-        return documents
+            except Exception as e:
+                logger.error(f"Error processing PDF file: {e}")
+                raise HTTPException(status_code=500, detail=f"Error processing PDF file: {e}")
+            logger.info(f"send {lengthDocuments} documents to redis")
+        logger.info(f"process PDF file completed with {index} batch pages")
+        serializable_documents = [doc.model_dump() for doc in documents]
+        return JSONResponse(
+            status_code=200,
+            content={
+                "success": True,
+                "message": f"Processed {index * batch_page_size} pages from PDF file.",
+                "documents": serializable_documents
+            }
+        )
     else:
         raise HTTPException(status_code=400, detail="Unsupported file type. Please upload a PDF file.")
 
@@ -241,6 +298,10 @@ async def process_file_docx_redis(
                 if(index < get_max_documents or get_max_documents == -1):
                     documents.append(doc)
                 index += 1
+        except asyncio.CancelledError:
+            logger.info("Request cancelled by the client")
+            raise HTTPException(status_code=499, detail="Client closed request")
+        
         except Exception as e:
             logger.error(f"Error processing DOCX file: {e}")
             raise HTTPException(status_code=500, detail=f"Error processing DOCX file: {e}")
@@ -301,34 +362,50 @@ async def create_collection(
             }
         )
 
-@app.post("/search-text")
+@app.post("/search-text", description="Search for documents in a collection using a text query. If score_threshold is not provided or less than or equal to 0, it will return all documents that match the query.")
 async def search(
-    collection_name: str = Body(...),
-    text_query: str = Body(...),
-    limit: int = Body(20),
-    score_threshold: float = Body(-1),
-    filters: list[str] = Body(["title_of_chunk"])
+    request: SearchTextModel,
 ) -> list[Document]:
+    collection_name: str = request.collection_name
+    text_query: str = request.text_query
+    limit: int = request.limit
+    score_threshold: float = request.score_threshold
+    filters: dict[str, str] = request.filters
     try:
+        if(score_threshold <= 0):
+            if(len(filters.items()) > 0):
+                res = await vector_store_service.search_with_filter(
+                    collection_name=collection_name,
+                    filters=filters,
+                    limit=limit,
+                )
+                return res
+            else:
+                raise HTTPException(
+                    status_code=400,
+                    detail="filters must be provided when score_threshold is less than or equal to 0"
+                )
+        elif(score_threshold > 1):
+            raise HTTPException(
+                status_code=400, 
+                detail="score_threshold must be between 0 and 1"
+            )
         res = await vector_store_service.search(
             collection_name, text_query, 
-            limit=limit, score_threshold=score_threshold if score_threshold != -1 else None,
-            filters=filters)
-        if(len(res) > 0):
-            return res
-        else:
-            return [Document(page_content="")]
+            limit=limit, score_threshold=score_threshold)
+        return res
     except Exception as e:
         logger.error(f"Error searching: {e}")
         raise HTTPException(status_code=500, detail=f"Error searching: {e}")
 
 @app.post("/search-rag")
 async def search_rag(
-    text_query: str = Body(...),
-    limit: int = Body(20),
-    limit_compressed: int = Body(3),
-    score_threshold: float = Body(0.7)
+    request: SearchRAGModel,
 ) -> list[Document]:
+    text_query: str = request.text_query
+    limit: int = request.limit
+    limit_compressed: int = request.limit_compressed
+    score_threshold: float = request.score_threshold
     try:
         res = await vector_store_service.compress_documents(
             text_query, limit_trieved=limit, 

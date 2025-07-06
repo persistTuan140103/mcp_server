@@ -1,0 +1,8 @@
+name: New prompt
+version: 0.0.1
+schema: v1
+prompts:
+  - name: Language Vietnamese
+    description: 
+      This prompt is designed to ensure that the response is in Vietnamese.
+    prompt: requires the response to be in Vietnamese, with specialized vocabulary then no translation is needed.

@@ -1,10 +1,12 @@
 import asyncio
+from io import BytesIO
 import uuid
 import html2text
 from langchain_unstructured import UnstructuredLoader
 from langchain.schema import Document
 from typing import List, Optional, Dict, AsyncGenerator
 import logging
+from scipy import io
 from tenacity import retry, retry_if_exception_type, stop_after_attempt, wait_fixed
 from unstructured.staging.base import elements_from_base64_gzipped_json
 from unstructured_client import RetryConfig, UnstructuredClient
@@ -12,8 +14,7 @@ from unstructured_client.utils.retries import BackoffStrategy
 from models.DocxModel import DocxModel
 from models.PdfModel import PdfModel
 from redis_stream import setup_logging
-# from markdownify import markdownify as md
-
+from PyPDF2 import PdfReader, PdfWriter
 
 setup_logging()
 logger = logging.getLogger(__name__)
@@ -75,10 +76,6 @@ class DocumentProcessor:
             
             # Cấu hình tối ưu cho PDF
             loader = UnstructuredLoader(
-                kwargs={
-                    "filename": model.file_name,
-                    "split_pdf_concurrency_level": 10
-                },
                 file=model.file,
                 timeout_ms=10000,
                 client=self.client,
@@ -106,7 +103,7 @@ class DocumentProcessor:
                 overlap=model.chunk_overlap,                # Overlap để đảm bảo context
                 overlap_all=True,                     # Apply overlap cho tất cả
                 multipage_sections=True,              # Cho phép sections span nhiều trang
-                split_pdf_concurrency_level=10,         # Concurrency cho PDF processing
+                split_pdf_concurrency_level=5,         # Concurrency cho PDF processing
                 split_pdf_page= True,                  # Split theo page cho PDF
                 
                 
@@ -258,6 +255,7 @@ class DocumentProcessor:
         except Exception as e:
             logger.error(f"Failed to decode or serialize orig_elements: {e}")
             return []
+    
     def __create_main_title(self, 
                             elements: List[dict]) -> str:
         res = []
@@ -265,7 +263,7 @@ class DocumentProcessor:
             if(item["type"] == "Title"):
                 res.append(item["text"])
         
-        return ".".join(res)
+        return ". ".join(res)
                             
     def __get_text_as_html(self, elements: list[Dict]) -> str:
         result = ""
@@ -289,5 +287,49 @@ class DocumentProcessor:
         markdown = converter.handle(html_content)
         
         return markdown
+
+    async def split_by_page(self, 
+                        file_obj: BytesIO, 
+                        batch_page = 40) -> AsyncGenerator[BytesIO, None]:
+        """
+        Chia file PDF thành các batch nhỏ hơn dựa trên số lượng trang
         
-    
+        Args:
+            file_obj: Đối tượng BytesIO chứa file PDF
+            batch_page: Số lượng trang tối đa trong mỗi batch
+        
+        Returns:
+            AsyncGenerator của BytesIO, mỗi phần là một batch nhỏ hơn của file PDF
+        """
+        file_obj.seek(0)
+        reader = PdfReader(file_obj)
+        total_pages = len(reader.pages)
+          
+        for i in range(0, total_pages, batch_page):
+            batch_reader = PdfWriter()
+            for j in range(i, min(i + batch_page - 1, total_pages)):
+                batch_reader.add_page(reader.pages[j])
+            
+            # Tạo file tạm thời cho batch
+            temp_file = BytesIO()
+            batch_reader.write(temp_file)
+            temp_file.seek(0)
+
+            yield temp_file
+
+    async def split_by_page_doc(self, 
+                            file_obj: BytesIO, 
+                            batch_page = 40) -> AsyncGenerator[BytesIO, None]:
+        """
+        Chia file DOCX thành các batch nhỏ hơn dựa trên số lượng trang
+        
+        Args:
+            file_obj: Đối tượng BytesIO chứa file DOCX
+            batch_page: Số lượng trang tối đa trong mỗi batch
+        
+        Returns:
+            AsyncGenerator của BytesIO, mỗi phần là một batch nhỏ hơn của file DOCX
+        """
+        # Hiện tại không có cách trực tiếp để chia DOCX theo trang
+        # Nên sẽ trả về toàn bộ file như một batch duy nhất
+        yield file_obj

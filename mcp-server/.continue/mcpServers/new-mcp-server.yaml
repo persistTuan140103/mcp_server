@@ -1,0 +1,6 @@
+# name: New MCP server
+# version: 0.0.1
+# schema: v1
+# mcpServers:
+#   - name: tlu_document
+#     command: D:\project\mcp_server\mcp-server\.venv\Scripts\tlu_mcp_server.exe

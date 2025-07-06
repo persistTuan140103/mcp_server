@@ -1,4 +1,5 @@
 from enum import Enum
+from fastapi import HTTPException
 from langchain.schema import Document
 from langchain_ollama import OllamaEmbeddings
 from langchain_core.embeddings import Embeddings
@@ -13,7 +14,7 @@ from qdrant_client import AsyncQdrantClient, models, QdrantClient
 from models.QdrantModel import QdrantStatus, QdrantCollection
 import logging
 from unstructured.cleaners.core import clean
-from services.ViRanker_Compressor import ViRankerCompressor
+from services.ViRanker_Compressor import ViRankerCrossEncoder
 
 logger = logging.getLogger(__name__)
 
@@ -24,45 +25,56 @@ class EmbeddingType(Enum):
     HUGGINGFACE = "huggingface"
     
 def getEmbedding(embeddingType: EmbeddingType):
-    match embeddingType:
-        case EmbeddingType.OLLAMA:
-            embeddings = OllamaEmbeddings(
-            model=settings.OLLAMA_MODEL_EMBEDDING,
-                base_url=settings.OLLAMA_BASE_URL,
-            )
-            return embeddings
-        case default:
-            raise ValueError(f"Invalid embedding type: {embeddingType}")
-
+    try:
+        
+        match embeddingType:
+            case EmbeddingType.OLLAMA:
+                embeddings = OllamaEmbeddings(
+                model=settings.OLLAMA_MODEL_EMBEDDING,
+                    base_url=settings.OLLAMA_BASE_URL,
+                )
+                return embeddings
+            case default:
+                raise ValueError(f"Invalid embedding type: {embeddingType}")
+    except Exception as e:
+        logger.error(f"Error initializing embedding: {e}")
+        raise HTTPException(status_code=500, detail=f"Error initializing embedding: {e}")
 class VectorStoreService:
     def __init__(self):
         self.collection_name = settings.QDRANT_COLLECTION_NAME
         logger.info(f"Initializing QdrantService for collection: {self.collection_name}")
-        
-        client : QdrantClient = QdrantClient(
-            url=settings.QDRANT_URL,
-            api_key=settings.QDRANT_API_KEY
-        )
-        
-        if(settings.CREATE_COLLECTION):
-            if(not client.collection_exists(settings.QDRANT_COLLECTION_NAME)):
-                client.create_collection(settings.QDRANT_COLLECTION_NAME,
-                                        vectors_config=models.VectorParams(
-                                            size=768,
-                                            distance=models.Distance.COSINE
-                                        ))
-        
-        self.embedding :Embeddings = getEmbedding(EmbeddingType(settings.EMBEDDING_TYPE))
-        
-        # Initialize vector store with sync client for compatibility
-        self.vector_store = QdrantVectorStore(
-                                client=client,
-                                collection_name=self.collection_name,
-                                embedding=self.embedding
-                            )
-        
-        
-        self.async_client :AsyncQdrantClient= None
+        try:
+            
+            client : QdrantClient = QdrantClient(
+                url=settings.QDRANT_URL,
+                api_key=settings.QDRANT_API_KEY
+            )
+            
+            if(settings.CREATE_COLLECTION):
+                if(not client.collection_exists(settings.QDRANT_COLLECTION_NAME)):
+                    client.create_collection(settings.QDRANT_COLLECTION_NAME,
+                                            vectors_config=models.VectorParams(
+                                                size=768,
+                                                distance=models.Distance.COSINE
+                                            ))
+            
+            self.embedding :Embeddings = getEmbedding(EmbeddingType(settings.EMBEDDING_TYPE))
+            
+            # Initialize vector store with sync client for compatibility
+            self.vector_store = QdrantVectorStore(
+                                    client=client,
+                                    collection_name=self.collection_name,
+                                    embedding=self.embedding
+                                )
+            self.top_n_ranker = 3
+            self.compressor = CrossEncoderReranker(
+                model=ViRankerCrossEncoder(),
+                top_n=self.top_n_ranker
+            )
+            self.async_client :AsyncQdrantClient= None
+        except HTTPException as e:
+            logger.error(f"Error initializing QdrantService: {e}")
+            raise Exception(f"Error initializing QdrantService: {e}")
         
     async def get_async_client(self):
         """Get async client when needed"""
@@ -212,8 +224,7 @@ class VectorStoreService:
 
     async def search(self, collection_name: str,
                      text_query: str, limit :int = 20,
-                     score_threshold: float = 0.7,
-                     filters: list[str] = None
+                     score_threshold: float = 0.7
                      ) -> list[Document]:
         """_summary_
 
@@ -239,15 +250,6 @@ class VectorStoreService:
             trailing_punctuation=True,
             lowercase=True
         )   
-        filter_must: list[models.FieldCondition]= []
-        if(filters is not None and score_threshold == -1):
-            for filter in filters:
-                filter_must.append(
-                    models.FieldCondition(
-                        key=filter,
-                        match=models.MatchText(text=text_query)
-                    )
-                )
         
         exists = await self.check_collection_exists(collection_name)
         if not exists:
@@ -255,13 +257,11 @@ class VectorStoreService:
             
 
         try:
+            
             res = await self.vector_store.asimilarity_search_with_relevance_scores(
                 query=text_query,
                 k=limit,
-                score_threshold= None if score_threshold == -1 else score_threshold,
-                filter=models.Filter(
-                    must=filter_must
-                )
+                score_threshold= score_threshold,
             )
             documents :list[Document] = []
 
@@ -309,53 +309,78 @@ class VectorStoreService:
             list[Document]: _description_
         """
         try:
-            self.viRankerCompressor = ViRankerCompressor(top_k=limit_compressed)
-        
-            self.compressor = CrossEncoderReranker(
-                model=HuggingFaceCrossEncoder(
-                    model_name=settings.HUGGINGFACE_MODEL_RERANK,
-                    model_kwargs={"device": "cuda" if torch.cuda.is_available() else "cpu"}
-                ),
-                top_n=3
-            )
+            self.top_n_ranker = limit_compressed
+            if(self.top_n_ranker < 1):
+                raise Exception("Limit for compressed documents must be greater than 0")
+            
             self.retriever = ContextualCompressionRetriever(
-                base_compressor=self.viRankerCompressor,
+                base_compressor=self.compressor,
                 base_retriever=self.vector_store.as_retriever(
                     search_kwargs={"k": limit_trieved, "score_threshold": score_threshold}
                 )
             )
             res = await self.retriever.ainvoke(query)
+            
             return res
         except Exception as e:
             raise Exception(e)
         
 
-    async def search_full_text(self, query: str, limit: int = 3) -> list[Document]:
-        query_clean = clean(
-            query,
-            extra_whitespace=True,
-            dashes=True,
-            bullets=True,
-            trailing_punctuation=True,
-            lowercase=True
-        )   
-        filter = models.FieldCondition(
-            key="title_of_chunk",
-            match=models.MatchText(text=query)
+    async def search_with_filter(
+        self, collection_name: str,
+        filters: dict[str, str] = None,
+        limit: int = 3) -> list[Document]:
+        
+        filter_must: list[models.FieldCondition] = []
+        if filters is not None:
+            for key, value in filters.items():
+                if(value is None or value == ""):
+                    raise Exception(f"Filter value for key '{key}' cannot be None or empty")
+                value_clean = clean(
+                    value,
+                    extra_whitespace=True,
+                    dashes=True,
+                    bullets=True,
+                    trailing_punctuation=True,
+                    lowercase=True
+                )   
+                filter_must.append(
+                    models.FieldCondition(
+                        key=key,
+                        match=models.MatchText(text=value_clean)
+                    )
+                )
+        client: AsyncQdrantClient = await self.get_async_client()
+        scrolls = await client.scroll(
+            collection_name=collection_name,
+            limit=limit,
+            scroll_filter=models.Filter(
+                must=filter_must
+            )
         )
         
-        try:
-            res = await self.vector_store.asimilarity_search(
-                query=query_clean,
-                k=limit,
-                filter=models.Filter(
-                    must=[
-                        filter
-                    ]
+        # breakpoint()
+        # print(f"Scrolls: {scrolls}")
+        
+        documents: list[Document] = []
+        if(len(scrolls[0]) == 0):
+            documents.append(
+                Document(
+                    page_content="",
+                    metadata={
+                        "message": "No documents found for the given filters"
+                    }
                 )
             )
-            
-            return res
-        except Exception as e:
-            raise Exception(e)
+            return documents
+        for scroll in scrolls[0]:
+            document = Document(
+                page_content=scroll.payload.get("metadata.content_original", ""),
+                metadata=scroll.payload.get("metadata", {})
+            )
+            documents.append(document)
+        
+        return documents
+        
+        
         
